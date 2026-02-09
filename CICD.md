@@ -75,6 +75,110 @@
   - CI平台：GitHub Actions / GitLab CI / Jenkins / Buildkite（任选）
   - 配置与参数：YAML + 可审计的 Pipeline-as-Code；敏感信息通过 CI Secret 管理
 
+#### 阶段 0.1：影响分析与执行计划生成（核心：变更→组件→构建目标→测试集）
+
+这一步的目标是让流水线“**足够快**”且“**足够安全**”：能按变更范围只跑必要的构建/测试，但一旦命中高风险规则就自动升级为全量，且每次选择都可解释、可复现。
+
+建议把影响分析做成一个**独立的Plan生成器**（不强依赖CI平台），输出统一的 `plan.json`（或YAML）作为后续所有Job的输入；同时把“为什么选这些目标/测试”的理由写进Plan，便于审计与排障。
+
+##### Step 1：拿到变更集（Change Set）
+
+- **单仓 PR/MR（常见）**
+  - 变更文件列表：`git diff --name-only origin/main...HEAD`
+  - 也可用平台API拿“PR changed files”（更快，避免拉全历史）
+- **多仓/系统集成（manifest场景）**
+  - 集成仓内：对比 manifest 的变更（系统版本坐标变化）
+  - 组件仓内：由 manifest 得到每个仓的 ref，再分别做 diff
+  - 推荐基准：把“**上次通过的系统版本**”（last green system version）记录下来（例如在集成仓打tag或写入一份 `last_green.json`），用它做对比基线，确保“从稳定→当前”的差异可复现
+
+输出：`changed_files[]`（可加 `repo` 字段，形成 `repo:path`）
+
+##### Step 2：文件映射到“组件/子系统”（Change → Component）
+
+最简单且非常有效：维护一份路径归属表，例如 `ownership/map.yaml`，做“路径前缀 → 组件”映射。
+
+- **示例（思路）**
+  - `kernel/` → `kernel`
+  - `rkipc/` → `ipc`
+  - `buildroot/` → `rootfs`
+  - `unity/Assets/...` → `unity_client`
+  - `cloud/backend/...` → `cloud_backend`
+  - `cloud/frontend/...` → `cloud_frontend`
+
+并在规则中加入“**升级为全量**”的开关（高风险判定）：
+
+- 改到以下内容时，直接判定 `risk=high`，升级为**全量构建/全量测试**（至少对该仓全量；系统集成可按策略升级为全系统全量）：
+  - `toolchain/`、`configs/`、`Kconfig`、公共头文件目录（如 `include/`）、基础镜像/基础容器（如 `docker/base/`）、CI/构建模板本身
+  - 任何会影响“ABI/接口契约/部署拓扑”的变更（例如 proto/OpenAPI、设备-云协议、Unity通信协议）
+
+输出：`changed_components[]` + `risk_level` + `reasons[]`
+
+##### Step 3：计算依赖闭包（Component → Downstream Closure）
+
+变更影响往往不是“只影响本组件”，需要把受影响范围扩展到下游。
+
+- **轻量方案（推荐一期开局）**：手工维护组件依赖图（DAG）
+  - 例如：`kernel → rootfs → image`，`cloud_backend → e2e_api_tests`
+  - 影响传播：从变更组件出发做下游闭包，得到 `impacted_components[]`
+- **重量方案（更自动、更精确）**：用构建系统的依赖查询
+  - Bazel：`bazel query "rdeps(//..., <changed_targets>)"` 反推受影响目标（精度高）
+  - CMake/Make：基于 `compile_commands.json` + `clang-scan-deps` / include分析推导头文件影响（工程量较大，建议二期）
+
+输出：`impacted_components[]` + `closure_reasons[]`
+
+##### Step 4：选择要跑的构建目标（Component → Build Targets）
+
+建议区分“总是跑”和“按影响跑”：
+
+- **总是跑（快速门禁）**
+  - lint/静态检查（尽量diff-based）
+  - 最小 smoke build（验证关键二进制/包能产出）
+- **按影响跑（节省大量时间）**
+  - 只构建受影响组件及其下游制品（镜像/容器/移动端包）
+  - 若 `risk=high`：升级为全量构建（至少覆盖该仓；系统集成可升级到全矩阵或指定关键矩阵）
+
+建议维护一份 `buildplan/map.yaml`：**组件 → 构建目标集合**，并把“目标矩阵”纳入选择（见上文 manifest 目标矩阵）。
+
+输出：`build_targets[]`（例如 `rk3588.image`、`1126b.image`、`orin.container`、`cloud.backend_image`、`unity.android_apk`）
+
+##### Step 5：选择要跑的测试（Build Targets → Test Suites）
+
+先做测试分层，再做影响选择与经验回归加权。
+
+- **测试分层（建议固定口径）**
+  - `smoke`（分钟级）
+  - `functional`（10–30分钟）
+  - `performance`（长耗时/资源占用高）
+  - `visual`（Unity可视化）
+- **映射表（强烈推荐）**：维护 `testplan/map.yaml`：**组件 → 必跑测试集**
+  - 例如：
+    - `camera` → `fps/drop/latency`（上板性能）
+    - `ota` → `A/B升级+回滚`（上板）
+    - `cloud_backend` → `api_contract + integration`（云端）
+    - `unity_client` → `visual_smoke + scene_trigger`（真机或模拟器）
+- **经验回归（低成本增益）**
+  - 基于历史失败统计：记录“哪个目录/组件的改动最容易打挂哪些测试”
+  - 用简单的 `变更路径 × 失败计数` 加权；命中就额外跑对应测试（避免只靠静态映射漏测）
+- **兜底策略**
+  - `nightly`/每日：全量构建 + 全量测试（覆盖影响分析漏网）
+  - 当 `risk=high` 或出现“新测试/新组件未纳入映射表”时：自动升级（至少跑全量 smoke + 关键E2E）
+
+输出：`test_suites[]` + `test_selection_reasons[]`
+
+##### Plan的标准化输出（建议）
+
+为了让“选择可解释”，建议Plan里至少包含：
+
+- 变更集：`changed_files`（带 repo）
+- 组件映射：`changed_components`、`impacted_components`
+- 风险：`risk_level`、`escalations[]`
+- 构建：`build_targets`
+- 测试：`test_suites`
+- 理由：每项选择的 `reasons[]`
+- 基线：`base_refs`（上次通过系统版本/各仓ref）
+
+后续阶段（构建/刷写/测试/Unity）只消费Plan，不再各自“重复做判断”，从而保证一致性与可复现。
+
 ### 阶段 1：多仓拉取与依赖锁定（编译前置）
 
 核心目标是“**一次构建可复现**”。
