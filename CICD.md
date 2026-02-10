@@ -179,6 +179,72 @@
 
 后续阶段（构建/刷写/测试/Unity）只消费Plan，不再各自“重复做判断”，从而保证一致性与可复现。
 
+##### 影响分析的更优方案（从易到难的升级路线）
+
+你们当前方案（输入变更文件列表 → `map.yaml` 规则映射组件 + 高风险升级全量 → 轻量DAG闭包 → 输出合同：`full_build / components / max_severity / unmatched_files`）已经是**性价比很高**的落地形态。进一步优化的关键方向是：**更少误伤（少跑）**、**更少漏测（该跑必跑）**、**可解释可治理（持续收敛）**。
+
+下面给出从易到难的升级路线，均可在不改变总体架构的前提下逐步演进。
+
+###### V1.5：规则增强（不引入重型依赖解析）
+
+- **严重级别细化（max_severity分层）**
+  - 把 `max_severity` 从 {low, high} 扩到 {low, medium, high, critical}
+  - 建议把严重级别直接映射到“要额外跑的层级”：
+    - `high`：全量构建 + `functional`
+    - `critical`：在 `high` 基础上再加 **上板（刷写+关键性能）+ `visual`（Unity）**
+- **高风险规则做细、做可解释**
+  - 将 `toolchain/`、`configs/`、`Kconfig/defconfig`、`DTS`、`include/公共头文件`、协议/IDL（proto/OpenAPI等）、镜像/基础容器等拆分为不同严重级别
+  - 在Plan里输出 `reasons[]`（命中哪条规则、由哪个文件触发），便于审计与排障
+- **组件内“子域/二级粒度”**
+  - 组件命名支持 `component:subdomain`（仍是规则驱动，但显著减少误伤）
+  - 示例：`kernel_6_1:media`、`kernel_6_1:net`、`buildroot:package/<name>`、`cloud_backend:auth`
+- **unmatched_files 的治理闭环**
+  - 只要出现 `unmatched_files`：
+    - 一期策略：默认提升为 `high/critical`（保守不漏测）
+    - 治理策略：要求补齐一条映射（让 `unmatched_files` 趋近于 0）
+
+###### V2：从“组件”升级到“构建目标 targets”（误伤最小化的关键）
+
+核心升级是：Plan 不仅输出 `components`，还输出 `build_targets`（CI按targets生成构建矩阵，而不是按组件粗粒度展开）。
+
+- **输出合同建议扩展**
+  - 新增：`build_targets[]`（例如 `kernel_image`、`rootfs_rk3588`、`rootfs_1126b`、`orin_container`、`unity_android_apk`、`cloud_backend_image`）
+  - CI：按 `build_targets` fan-out 并行构建；后续刷写/测试/Unity也按 targets 选择执行
+- **按构建系统的落地方式**
+  - **Bazel（最优）**：用 `bazel query "rdeps(//..., <changed_targets>)"` 精确反推受影响 targets（误伤最小）
+  - **CMake/Ninja（工程量中等，建议二期）**：基于 `compile_commands.json` + 依赖扫描近似推导“源文件→目标”
+  - **Buildroot/Yocto（可做到包/配方级）**
+    - Buildroot：`package/<pkg>` 变更 → 重建相关包 + rootfs打包（不必全量toolchain）
+    - Yocto：recipe/layer 级别归因 → 重建相关配方 + image重打包；命中 `layer.conf/local.conf` 等则升级高风险
+
+###### V2+：测试选择更聪明（从“组件→必跑测试”升级到“证据驱动”）
+
+在 `testplan/map.yaml（组件→必跑测试集）` 基础上增加两类“自动加测”：
+
+- **历史失败加权（实现简单、收益大）**
+  - 用历史数据统计：`变更路径/组件 × 测试集` 的失败次数/失败率
+  - 命中热点回归就额外跑对应测试，快速提升“命中率”
+- **覆盖率导向（精度高，但依赖体系完善）**
+  - 对云端后端/部分客户端逻辑，可用覆盖率把测试映射到模块，做到“只跑覆盖到变更区域的测试”
+- **flaky治理（减少噪声拖慢）**
+  - 把不稳定测试隔离成单独层级；失败自动重跑确认；长期以修复/隔离为目标收敛
+
+###### V3：依赖闭包来源自动化（减少手工DAG维护成本）
+
+你们的轻量DAG非常实用；更进一步可以逐步“自动导出/校准”依赖闭包来源，降低手工维护成本：
+
+- **从发布/打包拓扑导出**：镜像分层、容器 `FROM` 链、Helm chart依赖、OTA包组成关系
+- **从接口契约导出**：proto/OpenAPI/设备-云协议/Unity通信协议变更 → 自动升级严重级别并选择E2E/visual
+- **质量指标闭环（用nightly做真值近似）**
+  - 统计“漏测率/误杀率”，用 nightly 全量结果回溯并校准规则与DAG
+
+###### V4（可选，最强兜底）：语义级变更检测（接口/协议/ABI）
+
+适合“云 + 板 + Unity”的强集成系统，用于显著降低跨端联动的漏测风险：
+
+- **协议/接口契约变更检测**：对 proto/OpenAPI/schema 做diff，一旦变化直接标记 `critical` 并强制跑关键E2E + `visual`
+- **ABI/API兼容性检查（C/C++关键SDK/中间件）**：对导出符号与兼容性做检查，作为 `high/critical` 触发器
+
 ### 阶段 1：多仓拉取与依赖锁定（编译前置）
 
 核心目标是“**一次构建可复现**”。
