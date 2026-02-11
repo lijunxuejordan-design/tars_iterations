@@ -1,0 +1,417 @@
+import groovy.json.JsonSlurper
+import org.jenkinsci.plugins.configfiles.GlobalConfigFiles
+
+/**
+ * Example Jenkinsfile (distributed build + caches)
+ *
+ * What’s added vs original:
+ * - distcc: distributed compilation (requires distccd on build farm)
+ * - ccache: compiler cache (ideally stored on shared filesystem)
+ * - git/repo cache: repo init --reference + optimized sync
+ * - credentials: remove hard-coded tokens (use Jenkins credentials)
+ *
+ * Notes:
+ * - This is an EXAMPLE. You must set the credential IDs and cache paths
+ *   to match your Jenkins environment.
+ * - distcc only helps when the build actually spawns parallel compilation
+ *   (e.g., make -j / ninja). Ensure your build system uses parallel jobs.
+ */
+
+def SkipInvalidStages = false
+def ProhibitDevelopMr = false
+def IsTagPushBuild = false
+
+@NonCPS
+def parseNodeMap(String json) {
+    new groovy.json.JsonSlurper().parseText(json)
+}
+
+@NonCPS
+def createSimpleMap(String mapStr, String delimiter = ';') {
+    def map = [:]
+    if (!mapStr) return map
+    mapStr.split(delimiter).each { entry ->
+        def parts = entry.split(':', 2)
+        if (parts.size() == 2) {
+            map[parts[0]] = parts[1]
+        }
+    }
+    return map
+}
+
+@NonCPS
+def getPathFromUrl(String url) {
+    if (!url) return null
+    def normalizedUrl = url.replaceAll(/\.git$/, '')
+    def pathMatch = normalizedUrl =~ /(?:ssh|http|https|git):\/\/(?:[^@\/]+@)?[^\/]+(?::\d+)?\/(.+)/
+    if (pathMatch) {
+        def fullPath = pathMatch[0][1]
+        def pathParts = fullPath.split('/').findAll { it }
+        if (pathParts.size() > 1) {
+            return '/' + pathParts[1..-1].join('/')
+        } else if (pathParts.size() == 1) {
+            return null
+        }
+    }
+    return null
+}
+
+/**
+ * Build a distcc hosts string from Jenkins node->host map.
+ * Example output: "192.168.1.10/8,lzo 192.168.1.11/8,lzo"
+ */
+@NonCPS
+def buildDistccHosts(String nodeHostMapStr, int slotsPerHost = 8) {
+    def m = createSimpleMap(nodeHostMapStr)
+    def hosts = m.values().findAll { it }.unique()
+    return hosts.collect { h -> "${h}/${slotsPerHost},lzo" }.join(' ')
+}
+
+pipeline {
+    agent none
+
+    parameters {
+        choice(name: 'BUILD_ARCH', choices: ['x86', 'arm'], description: 'Select build architecture')
+        string(name: 'BUILD_NODE', defaultValue: 'X86-build-agent0', description: 'Select build node')
+        string(name: 'GITLAB_EVENT_TYPE', description: 'Webhook事件类型')
+        string(name: 'GIT_COMMIT', description: '提交哈希')
+        string(name: 'GIT_PROJECT_ID', description: 'GitLab项目ID')
+        string(name: 'GIT_PROJECT_NAME', description: 'GitLab项目名称')
+        string(name: 'PROJECT_URL', description: 'GitLab项目URL')
+
+        string(name: 'MR_SOURCE_BRANCH', description: '源分支')
+        string(name: 'MR_TARGET_BRANCH', description: '目标分支')
+        string(name: 'MR_LAST_COMMIT_ID', description: 'Merge Request最后提交哈希')
+        string(name: 'MR_OBJ_ATTR_STATE', description: 'Merge Request状态')
+        string(name: 'MR_OBJ_ATTR_ACTION', description: 'Merge Request操作')
+        string(name: 'MR_USER_NAME', description: 'Merge Request创建者用户名')
+        string(name: 'MR_URL', description: 'Merge Request URL')
+
+        string(name: 'TAG_NAME', description: '标签名称')
+        string(name: 'TAG_PUSH_COMMIT_ID', description: 'Tag Push提交哈希')
+    }
+
+    triggers {
+        /**
+         * IMPORTANT:
+         * - Do NOT hardcode webhook token in pipeline.
+         * - Use tokenCredentialId (Generic Webhook Trigger plugin) instead.
+         * - Replace 'gitlab-webhook-token' with your Jenkins credentials ID.
+         */
+        GenericTrigger(
+            genericVariables: [
+                [key: 'GITLAB_EVENT_TYPE', value: '$.object_kind'],
+                [key: 'GIT_COMMIT', value: '$.object_attributes.last_commit.id'],
+                [key: 'GIT_PROJECT_ID', value: '$.project.id'],
+                [key: 'GIT_PROJECT_NAME', value: '$.project.name'],
+                [key: 'PROJECT_URL', value: '$.project.ssh_url'],
+                [key: 'MR_SOURCE_BRANCH', value: '$.object_attributes.source_branch'],
+                [key: 'MR_TARGET_BRANCH', value: '$.object_attributes.target_branch'],
+                [key: 'MR_LAST_COMMIT_ID', value: '$.object_attributes.last_commit.id'],
+                [key: 'MR_OBJ_ATTR_STATE', value: '$.object_attributes.state'],
+                [key: 'MR_OBJ_ATTR_ACTION', value: '$.object_attributes.action'],
+                [key: 'MR_USER_NAME', value: '$.user.username'],
+                [key: 'MR_URL', value: '$.object_attributes.url'],
+                [key: 'TAG_NAME', value: '$.ref'],
+                [key: 'TAG_PUSH_COMMIT_ID', value: '$.checkout_sha']
+            ],
+            tokenCredentialId: 'gitlab-webhook-token',
+            causeString: 'Triggered by GitLab: ${GITLAB_EVENT_TYPE}',
+            printContributedVariables: true,
+            printPostContent: true
+        )
+    }
+
+    environment {
+        GITLAB_API_URL = "http://red-gitlab.tars-ai.com/api/v4"
+        // Replace with your Jenkins credentials ID (Secret Text) for GitLab API token.
+        GITLAB_TOKEN_CREDENTIALS_ID = "gitlab-api-token"
+
+        BUILD_URL = "https://nas_jenkins.tars-ai.com/blue/organizations/jenkins/auto_build_rk3588_bsp/detail/auto_build_rk3588_bsp/$env.BUILD_NUMBER/pipeline"
+
+        // From Jenkins global env vars (node map JSON)
+        X86_NODE_MAP = "${env.X86_NODES}"
+        ARM_NODE_MAP = "${env.ARM_NODES}"
+        PROJECT_DIRS_MAP = "${env.PROJECT_DIRS}"
+        NOTIFICATION_HOOK_MAP = "${env.MR_NOTIFICATION_HOOK}"
+
+        CLEAN_TAG_NAME = params.TAG_NAME.split('/').last()
+
+        // ---- Cache & distributed build knobs (tune to your infra) ----
+        // Shared cache roots (recommend: NFS/cephfs on all build agents)
+        CACHE_ROOT = "/mnt/gaea/cache"
+        CCACHE_ROOT = "/mnt/gaea/cache/ccache"
+        // A pre-warmed repo reference (mirror) for repo tool to speed up sync.
+        // Prepare this out-of-band (nightly job) to keep it fresh.
+        REPO_REFERENCE_ROOT = "/mnt/gaea/cache/repo-reference"
+
+        // Distcc
+        DISTCC_SLOTS_PER_HOST = "8"
+        DISTCC_ENABLE = "1"
+        CCACHE_ENABLE = "1"
+    }
+
+    stages {
+        stage('Trigger Info') {
+            agent any
+            steps {
+                script {
+                    echo "GITLAB_EVENT_TYPE: ${params.GITLAB_EVENT_TYPE}"
+                    echo "GIT_COMMIT: ${params.GIT_COMMIT}"
+                    echo "GIT_MR_USER ： ${params.MR_USER_NAME}"
+                    echo "GIT_PROJECT_NAME: ${params.GIT_PROJECT_NAME}"
+                    echo "GIT_PROJECT_ID: ${params.GIT_PROJECT_ID}"
+                    echo "MR_SOURCE_BRANCH: ${params.MR_SOURCE_BRANCH}"
+                    echo "MR_TARGET_BRANCH: ${params.MR_TARGET_BRANCH}"
+                    echo "MR_URL: ${params.MR_URL}"
+                    echo "MR_OBJ_ATTR_STATE: ${params.MR_OBJ_ATTR_STATE}"
+                    echo "MR_OBJ_ATTR_ACTION: ${params.MR_OBJ_ATTR_ACTION}"
+                    echo "TAG_NAME: ${env.CLEAN_TAG_NAME}"
+                }
+            }
+        }
+
+        stage('Trigger Event Type') {
+            steps {
+                script {
+                    echo "触发事件类型: ${params.GITLAB_EVENT_TYPE}"
+                    if (params.GITLAB_EVENT_TYPE == 'merge_request' &&
+                        params.MR_OBJ_ATTR_STATE == 'opened' &&
+                        ['open', 'update', 'reopen'].contains(params.MR_OBJ_ATTR_ACTION) &&
+                        params.MR_TARGET_BRANCH != 'roboapp_dev') {
+                        SkipInvalidStages = false
+                        echo "处理Merge Request: 源分支=${params.MR_SOURCE_BRANCH}, 目标分支=${params.MR_TARGET_BRANCH}"
+                    } else if (params.GITLAB_EVENT_TYPE == 'tag_push') {
+                        IsTagPushBuild = true
+                        SkipInvalidStages = false
+                        echo "处理Tag Push: 标签=${env.CLEAN_TAG_NAME}"
+                    } else {
+                        currentBuild.result = 'SUCCESS'
+                        SkipInvalidStages = true
+                    }
+
+                    ProhibitDevelopMr = false
+
+                    def mrNotifHooks = new groovy.json.JsonSlurper().parseText(env.NOTIFICATION_HOOK_MAP)
+                    def mrProjName = params.GIT_PROJECT_NAME.toString()
+                    env.MR_NOTIF_HOOK = mrNotifHooks[mrProjName]?.toString()
+                }
+            }
+        }
+
+        stage('Parse Project Dirs') {
+            when { expression { !SkipInvalidStages } }
+            steps {
+                script {
+                    def x86Nodes = parseNodeMap(env.X86_NODE_MAP)
+                    def armNodes = parseNodeMap(env.ARM_NODE_MAP)
+
+                    env.X86_NODE_HOST_MAP = x86Nodes.collect { k, v -> "$k:$v" }.join(';')
+                    env.ARM_NODE_HOST_MAP = armNodes.collect { k, v -> "$k:$v" }.join(';')
+
+                    def projectDirs = parseNodeMap(env.PROJECT_DIRS_MAP)
+                    def projectName = params.GIT_PROJECT_NAME.toString()
+                    env.MR_PROJECT_DIR = projectDirs[projectName]?.toString()
+
+                    echo """
+                    |锁定节点信息：
+                    |  X86节点映射：${x86Nodes}
+                    |  ARM节点映射：${armNodes}
+                    |  项目名称：${projectName}
+                    |  项目目录：${env.MR_PROJECT_DIR}
+                    """.stripMargin()
+                }
+            }
+        }
+
+        stage('Pipeline running') {
+            when { expression { !SkipInvalidStages } }
+            agent { node "master" }
+            steps {
+                script {
+                    echo "通知 GitLab：构建开始..."
+                    updateGitlabStatus(commitId: params.GIT_COMMIT, projectId: params.GIT_PROJECT_ID, state: 'pending')
+                    updateGitlabStatus(commitId: params.GIT_COMMIT, projectId: params.GIT_PROJECT_ID, state: 'running')
+                }
+            }
+        }
+
+        stage('Parallel Builds') {
+            when { expression { !SkipInvalidStages } }
+            parallel {
+                stage('Build on x86 (distcc+ccache)') {
+                    agent { node { label 'x86-builders' } }
+
+                    stages {
+                        stage('x86: Setup distcc/ccache/git cache') {
+                            steps {
+                                script {
+                                    def slots = (env.DISTCC_SLOTS_PER_HOST ?: "8") as Integer
+                                    def hosts = buildDistccHosts(env.X86_NODE_HOST_MAP, slots)
+                                    // Allow override from Jenkins global env if you prefer:
+                                    // env.DISTCC_HOSTS = env.DISTCC_HOSTS_X86 ?: hosts
+                                    env.DISTCC_HOSTS = hosts
+                                    echo "DISTCC_HOSTS=${env.DISTCC_HOSTS}"
+                                }
+                                sh '''
+                                    #!/usr/bin/env bash
+                                    set -euo pipefail
+
+                                    echo "[INFO] Tooling versions"
+                                    command -v distcc >/dev/null 2>&1 && distcc --version || echo "[WARN] distcc not found"
+                                    command -v ccache >/dev/null 2>&1 && ccache --version || echo "[WARN] ccache not found"
+                                    command -v repo >/dev/null 2>&1 && repo version || echo "[WARN] repo not found"
+
+                                    # Prepare cache dirs (recommend shared FS)
+                                    mkdir -p "${CCACHE_ROOT}/${JOB_NAME}" || true
+                                '''
+                            }
+                        }
+
+                        stage('x86: Repo sync (use reference cache when available)') {
+                            steps {
+                                script {
+                                    def projectPath = getPathFromUrl(params.PROJECT_URL)
+                                    env.PROJECT_PATH_FROM_URL = projectPath ?: ''
+                                }
+                                sh '''
+                                    #!/usr/bin/env bash
+                                    set -euo pipefail
+
+                                    export GIT_OPTIONAL_LOCKS=0
+                                    export GIT_LFS_SKIP_SMUDGE=1
+
+                                    mkdir -p "${WORKSPACE}/1_RK3588"
+                                    cd "${WORKSPACE}/1_RK3588"
+
+                                    REF_ARG=""
+                                    if [[ -d "${REPO_REFERENCE_ROOT}/rk3588_sdk" ]]; then
+                                      REF_ARG="--reference=${REPO_REFERENCE_ROOT}/rk3588_sdk"
+                                      echo "[INFO] Using repo reference: ${REPO_REFERENCE_ROOT}/rk3588_sdk"
+                                    else
+                                      echo "[INFO] Repo reference not found; doing normal sync"
+                                    fi
+
+                                    if [[ ! -d ".repo" ]]; then
+                                      echo "[INFO] repo init (with reference if available)"
+                                      repo init -u ssh://git@red-gitlab.tars-ai.com:2222/rk3588_sdk/manifest.git -b master ${REF_ARG}
+                                    fi
+
+                                    echo "[INFO] repo sync (optimized)"
+                                    repo sync -c --no-tags --optimized-fetch --prune -j"$(nproc)"
+
+                                    echo "[INFO] Switch all repos to target branch if exists"
+                                    repo forall -c "git reset --hard"
+                                    repo forall -c "git fetch origin ${MR_TARGET_BRANCH} || true"
+                                    repo forall -c "git checkout -B ${MR_TARGET_BRANCH} origin/${MR_TARGET_BRANCH} || true"
+
+                                    echo "[INFO] Checkout MR source branch in the changed project path"
+                                    if [[ -n "${PROJECT_PATH_FROM_URL}" ]]; then
+                                      cd "${WORKSPACE}/1_RK3588/${PROJECT_PATH_FROM_URL}"
+                                      git fetch origin "${MR_SOURCE_BRANCH}" || true
+                                      git checkout -B "${MR_SOURCE_BRANCH}" "origin/${MR_SOURCE_BRANCH}" || true
+                                    fi
+
+                                    echo "[INFO] Pull LFS where needed"
+                                    repo forall -c "git-lfs pull" || true
+                                '''
+                            }
+                        }
+
+                        stage('x86: Build (distcc + ccache)') {
+                            steps {
+                                script {
+                                    def ccacheDir = "${env.CCACHE_ROOT}/${env.JOB_NAME}/x86"
+                                    env.CCACHE_DIR = ccacheDir
+                                }
+                                sh '''
+                                    #!/usr/bin/env bash
+                                    set -euo pipefail
+
+                                    # ---- distcc ----
+                                    if [[ "${DISTCC_ENABLE}" == "1" ]]; then
+                                      export DISTCC_HOSTS="${DISTCC_HOSTS}"
+                                      export DISTCC_DIR="${WORKSPACE}/.distcc"
+                                      export DISTCC_FALLBACK=1
+                                      export DISTCC_VERBOSE=1
+                                      mkdir -p "${DISTCC_DIR}"
+                                      echo "[INFO] distcc hosts: ${DISTCC_HOSTS}"
+                                    fi
+
+                                    # ---- ccache ----
+                                    if [[ "${CCACHE_ENABLE}" == "1" ]]; then
+                                      export CCACHE_DIR="${CCACHE_DIR}"
+                                      export CCACHE_BASEDIR="${WORKSPACE}/1_RK3588"
+                                      export CCACHE_COMPRESS=1
+                                      export CCACHE_COMPRESSLEVEL=6
+                                      export CCACHE_MAXSIZE=50G
+                                      export CCACHE_UMASK=002
+                                      # Use distcc as compiler prefix to distribute cache misses
+                                      export CCACHE_PREFIX="distcc"
+                                      mkdir -p "${CCACHE_DIR}"
+                                      ccache -z || true
+                                    fi
+
+                                    # Make sure parallelism is enabled (distcc only helps with -j / ninja)
+                                    export MAKEFLAGS="${MAKEFLAGS:--j$(nproc)}"
+
+                                    cd "${WORKSPACE}/1_RK3588"
+                                    echo "[INFO] 执行构建..."
+                                    ./build.sh tars_fpv_V1_0_defconfig
+                                    ./build.sh
+
+                                    if [[ "${CCACHE_ENABLE}" == "1" ]]; then
+                                      echo "[INFO] ccache stats"
+                                      ccache -s || true
+                                    fi
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            node('master') {
+                script {
+                    if (!SkipInvalidStages) {
+                        echo "通知 GitLab：构建结果..."
+                        if (currentBuild.result == 'SUCCESS') {
+                            updateGitlabStatus(commitId: params.GIT_COMMIT, projectId: params.GIT_PROJECT_ID, state: 'success')
+                        } else {
+                            updateGitlabStatus(commitId: params.GIT_COMMIT, projectId: params.GIT_PROJECT_ID, state: 'failed')
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+def updateGitlabStatus(Map args) {
+    script {
+        def apiUrl = "${env.GITLAB_API_URL}/projects/${args.projectId}/statuses/${args.commitId}"
+        def jsonData = groovy.json.JsonOutput.toJson([
+            state: args.state,
+            target_url: env.BUILD_URL,
+            context: 'jenkins/build',
+            description: "Build ${args.state}"
+        ])
+
+        echo "调用GitLab API: URL=${apiUrl}"
+
+        withCredentials([string(credentialsId: env.GITLAB_TOKEN_CREDENTIALS_ID, variable: 'GITLAB_TOKEN')]) {
+            sh """
+                curl -X POST \\
+                        -H 'PRIVATE-TOKEN: ${GITLAB_TOKEN}' \\
+                        -H 'Content-Type: application/json' \\
+                        -d '${jsonData}' \\
+                        '${apiUrl}'
+            """
+        }
+    }
+}
+
